@@ -75,7 +75,7 @@ jobs:
         uses: esphome/build-action@v7
         with:
           yaml_file: ${{ matrix.config }}
-          version: 2024.9.2
+          version: 2024.11.0
           complete-manifest: true
           ota_password: ${{ secrets.OTA_PASSWORD }}
 
