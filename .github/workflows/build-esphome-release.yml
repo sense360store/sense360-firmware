@@ -154,7 +154,7 @@ jobs:
     needs: publish
     env:
       GH_PAGES_PUBLISH: ${{ secrets.GH_PAGES_PUBLISH }}
-    if: ${{ env.GH_PAGES_PUBLISH == 'true' }}
+    if: ${{ secrets.GH_PAGES_PUBLISH == 'true' }}
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
