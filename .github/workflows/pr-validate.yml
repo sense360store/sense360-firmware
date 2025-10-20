@@ -1,0 +1,76 @@
+name: PR Validate
+
+on:
+  pull_request:
+    paths:
+      - 'firmware/**/*.yaml'
+
+jobs:
+  discover:
+    name: Discover modified configs
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build matrix of modified YAML files
+        id: set-matrix
+        shell: bash
+        run: |
+          set -eo pipefail
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          CHANGED_FILES=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- 'firmware/**/*.yaml' | tr -d '\r')
+          if [ -z "$CHANGED_FILES" ]; then
+            echo '::error::No matching YAML configuration files detected in this pull request.'
+            exit 1
+          fi
+
+          MATRIX=$(printf '%s\n' "$CHANGED_FILES" | jq -R -s '
+            split("\n")
+            | map(select(length > 0))
+            | map({
+                config: .,
+                device: (. | split("/") | last | sub("\\.yaml$"; ""))
+              })
+            | {include: .}
+          ')
+
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Compile firmware
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Compile ${{ matrix.device }} firmware
+        id: compile
+        continue-on-error: true
+        uses: esphome/build-action@v7
+        with:
+          yaml_file: ${{ matrix.config }}
+          ota_password: ${{ secrets.OTA_PASSWORD }}
+
+      - name: Fail when compilation fails
+        if: steps.compile.outcome != 'success'
+        run: |
+          echo '::error::ESPHome build failed for ${{ matrix.config }}.'
+          exit 1
+
+      - name: Upload firmware artifacts
+        if: steps.compile.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.device }}
+          path: dist/${{ matrix.device }}/
+          if-no-files-found: error
