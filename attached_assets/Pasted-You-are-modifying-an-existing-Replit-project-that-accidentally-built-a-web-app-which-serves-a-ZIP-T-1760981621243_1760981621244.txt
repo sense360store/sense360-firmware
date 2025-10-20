@@ -1,0 +1,257 @@
+You are modifying an existing Replit project that accidentally built a web app which serves a ZIP. That is WRONG.
+
+Goal (very specific):
+- Replace the web app with a **repo bootstrap** that, when run, writes GitHub Actions + helper scripts to the repo so that pushing ESPHome YAML to GitHub automatically validates and compiles firmware into `.bin` artifacts, and (optionally) creates tagged releases + WebFlash manifest.
+- Do **NOT** create or run any web server or browser UI.
+- Do **NOT** touch any existing `esphome/**` content the user already has.
+
+Non-goals:
+- No Express/Flask/Vite/Next.js/etc.
+- No HTML/CSS/JS frontends.
+- No download endpoints.
+
+What to build exactly:
+1) Create a shell script at repo root: `bootstrap_ci.sh`. It writes:
+   - `.github/workflows/esphome-lite.yml` (always) → validates + compiles on PR/push, uploads `.bin` artifacts.
+   - If env var `MODE=full`, also writes:
+     - `.github/workflows/esphome-release.yml` (tag `vX.Y.Z` builds, renames bins, generates manifest, attaches to Release).
+     - `scripts/rename_bins.py` and `scripts/gen_manifest.py`.
+   - Adds `esphome/secrets.example.yaml` (placeholder) if missing.
+   - Adds `webflash/manifest.template.json` if missing.
+   - Git-inits and commits the changes (idempotent).
+2) Add a `.replit` file that stops Replit from trying to run a web server.
+
+Create/overwrite these files with EXACT contents:
+
+----- /.replit -----
+run = "echo 'Use the Shell: bash bootstrap_ci.sh (or MODE=full bash bootstrap_ci.sh)'; sleep 3600"
+
+----- /bootstrap_ci.sh -----
+set -euo pipefail
+MODE="${MODE:-lite}"   # 'lite' or 'full'
+echo "Bootstrap mode: $MODE"
+
+mkdir -p .github/workflows scripts esphome webflash
+
+# Placeholder secrets so CI can compile without real Wi-Fi/API/OTA
+if [ ! -f esphome/secrets.example.yaml ]; then
+  cat > esphome/secrets.example.yaml <<'YAML'
+wifi_ssid: "YOUR_WIFI_SSID"
+wifi_password: "YOUR_WIFI_PASSWORD"
+api_key: "REPLACE_WITH_BASE64_32B_KEY"   # openssl rand -base64 32
+ota_password: "REPLACE_WITH_STRONG_PASSWORD"
+YAML
+fi
+
+# Optional WebFlash template
+if [ ! -f webflash/manifest.template.json ]; then
+  cat > webflash/manifest.template.json <<'JSON'
+{
+  "$schema": "https://esphome.io/web/manifest-schema.json",
+  "name": "Sense360",
+  "version": "vX.Y.Z",
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [{ "path": "sense360-airiq-basic-vX.Y.Z.bin", "offset": 0 }],
+      "capabilities": ["airiq","sen55","scd4x","ld2412","basic"]
+    },
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [{ "path": "sense360-airiq-pro-vX.Y.Z.bin", "offset": 0 }],
+      "capabilities": ["airiq","sen55","scd4x","ld2412","pro","diagnostics"]
+    }
+  ]
+}
+JSON
+fi
+
+# ---- Lite CI: validate + compile + upload artifacts ----
+cat > .github/workflows/esphome-lite.yml <<'YAML'
+name: ESPHome Lite CI
+on:
+  push: { paths: ["esphome/**"] }
+  pull_request: { paths: ["esphome/**"] }
+  workflow_dispatch:
+
+jobs:
+  build-all:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ESPHome
+        run: pip install --upgrade "esphome>=2024.11.0"
+      - name: Prepare secrets placeholder
+        run: |
+          mkdir -p esphome
+          [ -f esphome/secrets.yaml ] || cp esphome/secrets.example.yaml esphome/secrets.yaml
+      - name: Validate & compile all non-factory configs
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          mkdir -p out
+          found=0
+          for cfg in esphome/configs/**/*.yaml; do
+            [[ "$cfg" == *"_factory.yaml" ]] && continue
+            echo "==> Validating: $cfg"
+            esphome config "$cfg"
+            echo "==> Compiling:  $cfg"
+            esphome compile "$cfg"
+            found=1
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "No non-factory configs found under esphome/configs/**.yaml"
+          fi
+          find . -type f -name "*.bin" -print -exec cp -v {} out/ \;
+      - name: Upload firmware artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-bins
+          path: out
+          if-no-files-found: warn
+YAML
+
+if [ "$MODE" = "full" ]; then
+  # ---- Tag Release workflow ----
+  cat > .github/workflows/esphome-release.yml <<'YAML'
+name: ESPHome Tag Release
+on:
+  push: { tags: ["v*.*.*"] }
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version (e.g., v1.2.3). Leave empty to use tag name."
+        required: false
+        default: ""
+permissions: { contents: write }
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: pip install --upgrade "esphome>=2024.11.0"
+      - name: Prepare secrets placeholder
+        run: |
+          mkdir -p esphome
+          [ -f esphome/secrets.yaml ] || cp esphome/secrets.example.yaml esphome/secrets.yaml
+      - name: Validate & compile
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          mkdir -p dist
+          found=0
+          for cfg in esphome/configs/**/*.yaml; do
+            [[ "$cfg" == *"_factory.yaml" ]] && continue
+            echo "==> Validating: $cfg"
+            esphome config "$cfg"
+            echo "==> Compiling:  $cfg"
+            esphome compile "$cfg"
+            found=1
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "No non-factory configs found."; exit 1
+          fi
+          find . -type f -name "*.bin" -print -exec cp -v {} dist/ \;
+      - name: Determine version
+        id: ver
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "v=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "v=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          fi
+          echo "Version = ${{ steps.ver.outputs.v }}"
+      - name: Rename firmware
+        run: python3 scripts/rename_bins.py dist "${{ steps.ver.outputs.v }}" release
+      - name: Generate WebFlash manifest (if template present)
+        if: hashFiles('webflash/manifest.template.json') != ''
+        run: python3 scripts/gen_manifest.py webflash/manifest.template.json "${{ steps.ver.outputs.v }}" release/manifest.json
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.v }}
+          name: Sense360 ESPHome ${{ steps.ver.outputs.v }}
+          files: |
+            release/*.bin
+            release/manifest.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+YAML
+
+  cat > scripts/rename_bins.py <<'PY'
+#!/usr/bin/env python3
+import sys, pathlib, re, shutil
+if len(sys.argv) != 4:
+    print("Usage: rename_bins.py <dist_dir> <version> <out_dir>", file=sys.stderr); sys.exit(2)
+dist = pathlib.Path(sys.argv[1]); version = sys.argv[2]; out = pathlib.Path(sys.argv[3])
+out.mkdir(parents=True, exist_ok=True)
+bins = sorted(dist.glob("*.bin"))
+if not bins:
+    print("No .bin files found in dist", file=sys.stderr); sys.exit(1)
+def guess(pp: pathlib.Path):
+    s = pp.name.lower()
+    product = "firmware"; profile = "build"
+    if "airiq" in s: product = "airiq"
+    for p in ("basic","pro"):
+        if p in s: profile = p
+    return product, profile
+for f in bins:
+    product, profile = guess(f)
+    target = out / f"sense360-{product}-{profile}-{version}.bin"
+    shutil.copy2(f, target)
+    print(f"{f.name} -> {target.name}")
+PY
+  chmod +x scripts/rename_bins.py
+
+  cat > scripts/gen_manifest.py <<'PY'
+#!/usr/bin/env python3
+import sys, json, pathlib
+if len(sys.argv) != 4:
+    print("Usage: gen_manifest.py <template> <version> <output>", file=sys.stderr); sys.exit(2)
+template, version, output = map(pathlib.Path, sys.argv[1:])
+data = json.loads(template.read_text(encoding="utf-8"))
+def repl(x):
+    if isinstance(x, dict): return {k: repl(v) for k,v in x.items()}
+    if isinstance(x, list): return [repl(v) for v in x]
+    if isinstance(x, str):  return x.replace("vX.Y.Z", version)
+    return x
+output.write_text(json.dumps(repl(data), indent=2), encoding="utf-8")
+print(f"Wrote {output}")
+PY
+  chmod +x scripts/gen_manifest.py
+fi
+
+# Git init/commit (idempotent; won't fail if already exists)
+if [ ! -d .git ]; then git init && git branch -M main || true; fi
+git add .github/workflows esphome/secrets.example.yaml webflash scripts .replit bootstrap_ci.sh 2>/dev/null || true
+git add .  # include any existing esphome/** configs
+git commit -m "chore(ci): add ESPHome ${MODE} CI automation" || true
+
+echo
+echo "✅ Bootstrap complete."
+echo "Next:"
+echo "  1) Push:  git remote add origin <YOUR_GITHUB_REPO_URL>  (once);  git push -u origin main"
+echo "  2) GitHub → Settings → Actions:"
+echo "       - Allow all actions; Workflow permissions = Read & write"
+echo "  3) Push any change under esphome/** to trigger CI (Artifacts → firmware-bins)."
+if [ "$MODE" = "full" ]; then
+  echo "  4) Tag a release:  git tag v1.0.0 && git push origin v1.0.0  → Release with renamed .bin + manifest.json"
+fi
+
+Acceptance criteria:
+- No HTTP server files are created or modified.
+- Running `bash bootstrap_ci.sh` creates `.github/workflows/esphome-lite.yml` and placeholder secrets.
+- Running `MODE=full bash bootstrap_ci.sh` also creates release workflow + scripts.
+- Existing `esphome/**` is untouched.
+- After pushing to GitHub, Actions compile and attach `.bin` artifacts on push; releases attach renamed `.bin` + manifest on tags.

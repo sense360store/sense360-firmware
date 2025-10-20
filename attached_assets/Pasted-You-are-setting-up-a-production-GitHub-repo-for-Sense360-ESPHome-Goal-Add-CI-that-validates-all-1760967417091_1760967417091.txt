@@ -1,0 +1,276 @@
+You are setting up a production GitHub repo for Sense360 ESPHome.
+
+Goal:
+- Add CI that validates all configs (excluding *_factory.yaml) and compiles firmware .bin.
+- Add Release automation that, on a git tag like v1.2.3, compiles, renames .bin to sense360-<product>-<basic|pro>-vX.Y.Z.bin, generates webflash/manifest.json from template, and attaches both bins + manifest to the GitHub Release.
+- Keep secrets out of repo. CI should auto-create a placeholder secrets.yaml from secrets.example.yaml just for compiling.
+
+Assume the repo already contains:
+- /esphome/ (with configs/, packages/, webflash/manifest.template.json, secrets.example.yaml, etc.)
+- The AirIQ Basic/Pro configs you saw earlier.
+
+Do the following EXACTLY:
+
+1) Create these new files (exact paths & contents):
+
+# .github/workflows/firmware-ci.yml
+# Validates and compiles on PRs/pushes. Uploads build artifacts per config.
+--------------------------------------------------
+name: ESPHome CI
+
+on:
+  pull_request:
+    paths:
+      - "esphome/**"
+      - "scripts/**"
+      - ".github/workflows/**"
+  push:
+    branches: [ main, master ]
+    paths:
+      - "esphome/**"
+      - "scripts/**"
+      - ".github/workflows/**"
+  workflow_dispatch:
+
+jobs:
+  enumerate:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+      count: ${{ steps.set.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build matrix from configs
+        id: set
+        run: |
+          python3 scripts/build_matrix.py > matrix.json
+          echo "matrix=$(cat matrix.json)" >> "$GITHUB_OUTPUT"
+          echo "count=$(jq 'length' matrix.json)" >> "$GITHUB_OUTPUT"
+      - name: Show matrix
+        run: cat matrix.json
+
+  build:
+    needs: enumerate
+    if: ${{ needs.enumerate.outputs.count != '0' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cfg: ${{ fromJSON(needs.enumerate.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            pip-${{ runner.os }}-
+
+      - name: Install ESPHome
+        run: pip install --upgrade "esphome>=2024.11.0"
+
+      - name: Prepare secrets placeholder
+        run: |
+          mkdir -p esphome
+          if [ ! -f esphome/secrets.yaml ]; then
+            cp esphome/secrets.example.yaml esphome/secrets.yaml
+          fi
+
+      - name: Validate ${{ matrix.cfg.path }}
+        run: esphome config "${{ matrix.cfg.path }}"
+
+      - name: Compile ${{ matrix.cfg.path }}
+        run: esphome compile "${{ matrix.cfg.path }}"
+
+      - name: Collect .bin for ${{ matrix.cfg.slug }}
+        run: |
+          mkdir -p out/${{ matrix.cfg.slug }}
+          find . -type f -name "*.bin" -print -exec cp -v {} out/${{ matrix.cfg.slug }}/ \;
+
+      - name: Upload artifacts for ${{ matrix.cfg.slug }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.cfg.slug }}-bins
+          path: out/${{ matrix.cfg.slug }}
+--------------------------------------------------
+
+# .github/workflows/release.yml
+# On tag push vX.Y.Z or manual dispatch, compile, rename, generate manifest, and attach to the Release.
+--------------------------------------------------
+name: ESPHome Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version (e.g., v1.2.3). Leave empty to use tag name when run from a tag."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  enumerate:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+      count: ${{ steps.set.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build matrix from configs
+        id: set
+        run: |
+          python3 scripts/build_matrix.py > matrix.json
+          echo "matrix=$(cat matrix.json)" >> "$GITHUB_OUTPUT"
+          echo "count=$(jq 'length' matrix.json)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: enumerate
+    if: ${{ needs.enumerate.outputs.count != '0' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cfg: ${{ fromJSON(needs.enumerate.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+          pip install --upgrade "esphome>=2024.11.0"
+
+      - name: Prepare secrets placeholder
+        run: |
+          mkdir -p esphome
+          if [ ! -f esphome/secrets.yaml ]; then
+            cp esphome/secrets.example.yaml esphome/secrets.yaml
+          fi
+
+      - name: Validate ${{ matrix.cfg.path }}
+        run: esphome config "${{ matrix.cfg.path }}"
+
+      - name: Compile ${{ matrix.cfg.path }}
+        run: esphome compile "${{ matrix.cfg.path }}"
+
+      - name: Gather bins
+        run: |
+          mkdir -p out/${{ matrix.cfg.slug }}
+          find . -type f -name "*.bin" -print -exec cp -v {} out/${{ matrix.cfg.slug }}/ \;
+
+      - name: Upload artifacts for ${{ matrix.cfg.slug }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.cfg.slug }}-bins
+          path: out/${{ matrix.cfg.slug }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Determine version
+        id: ver
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "v=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "v=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          fi
+          echo "Version = $(cat $GITHUB_OUTPUT)"
+
+      - name: Rename firmware to Sense360 naming
+        run: |
+          python3 scripts/rename_bins.py "dist" "${{ steps.ver.outputs.v }}" "release"
+
+      - name: Generate WebFlash manifest from template
+        run: |
+          python3 scripts/gen_manifest.py "webflash/manifest.template.json" "${{ steps.ver.outputs.v }}" "release/manifest.json"
+
+      - name: Show release payload
+        run: |
+          ls -al release
+          cat release/manifest.json || true
+
+      - name: Create GitHub Release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.v }}
+          name: Sense360 ESPHome ${{ steps.ver.outputs.v }}
+          draft: false
+          prerelease: false
+          files: |
+            release/*.bin
+            release/manifest.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+--------------------------------------------------
+
+# scripts/build_matrix.py
+# Enumerates all configs/**.yaml excluding *_factory.yaml and returns JSON list of objects.
+--------------------------------------------------
+#!/usr/bin/env python3
+import json, pathlib, re
+root = pathlib.Path("esphome/configs")
+items = []
+for p in root.rglob("*.yaml"):
+    if p.name.endswith("_factory.yaml"):
+        continue
+    rel = p.as_posix()
+    # Expect pattern: configs/<product>/<product>_<profile>.yaml
+    m = re.match(r"esphome/configs/([^/]+)/([^/]+)\.yaml$", rel)
+    if not m:
+        # Fallback: product = dir, profile = file stem
+        product = p.parent.name
+        profile = p.stem
+    else:
+        product = m.group(1)
+        stem = p.stem
+        # If named like airiq_basic.yaml -> profile = basic
+        profile = stem.replace(product + "_", "", 1) if stem.startswith(product + "_") else stem
+    slug = f"{product}-{profile}"
+    items.append({"path": rel, "product": product, "profile": profile, "slug": slug})
+print(json.dumps(items))
+--------------------------------------------------
+
+# scripts/rename_bins.py
+# Picks newest .bin per slug dir and renames to sense360-<product>-<profile>-<version>.bin
+--------------------------------------------------
+#!/usr/bin/env python3
+import sys, pathlib, shutil, time
+
+if len(sys.argv) != 4:
+    print("Usage: rename_bins.py <artifacts_root> <version> <release_dir>", file=sys.stderr)
+    sys.exit(2)
+
+artifacts_root = pathlib.Path(sys.argv[1])
+version = sys.argv[2].lstrip()  # expect 'vX.Y.Z'
+release_dir = pathlib.Path(sys.argv[3])
+release_dir.mkdir(parents=True, exist_ok=True)
+
+for slug_dir in artifacts_root.iterdir():
+    if not slug_dir.is_dir():
+        continu
