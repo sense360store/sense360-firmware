@@ -1,0 +1,194 @@
+name: Build ESPHome Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  discover:
+    name: Discover firmware configurations
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.configs.outputs.matrix }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Find configuration files
+        id: configs
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+
+          configs=()
+          for file in firmware/configurations/**/*.yaml; do
+            if [ -f "$file" ]; then
+              configs+=("$file")
+            fi
+          done
+
+          if [ ${#configs[@]} -eq 0 ]; then
+            echo "No firmware configuration YAML files found under firmware/configurations/." >&2
+            exit 1
+          fi
+
+          printf 'Found %s configuration(s):\n' "${#configs[@]}"
+          printf ' - %s\n' "${configs[@]}"
+
+          json=$(printf '%s\n' "${configs[@]}" | jq -R '{config: ., device: (split("/") | .[-1] | sub("\\.ya?ml$"; ""))}' | jq -s '{include: .}')
+          echo "matrix=$json" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build firmware (${{ matrix.device }})
+    runs-on: ubuntu-latest
+    needs: discover
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Cache ESPHome dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.esphome
+          key: ${{ runner.os }}-esphome-${{ matrix.device }}
+          restore-keys: |
+            ${{ runner.os }}-esphome-
+
+      - name: Build firmware
+        uses: esphome/build-action@v7
+        with:
+          yaml_file: ${{ matrix.config }}
+          version: 2024.9.2
+          complete-manifest: true
+          ota_password: ${{ secrets.OTA_PASSWORD }}
+
+      - name: Organize build artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          device="${{ matrix.device }}"
+          mkdir -p "dist/${device}"
+
+          shopt -s nullglob
+          files_moved=0
+          for file in dist/*; do
+            if [ -f "$file" ]; then
+              mv "$file" "dist/${device}/"
+              files_moved=$((files_moved + 1))
+            fi
+          done
+
+          if [ "$files_moved" -eq 0 ] && [ "$(find "dist/${device}" -type f | wc -l)" -eq 0 ]; then
+            echo "No firmware files produced for ${device}." >&2
+            exit 1
+          fi
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.device }}
+          path: dist/${{ matrix.device }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download firmware artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Aggregate manifests
+        run: python3 scripts/aggregate_manifests.py dist
+
+      - name: Load changelog
+        id: changelog
+        shell: bash
+        run: |
+          if [ -f CHANGELOG.md ]; then
+            {
+              echo "body<<'EOF'"
+              cat CHANGELOG.md
+              echo 'EOF'
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "body=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/**/*.bin
+            dist/**/*.json
+          body: ${{ steps.changelog.outputs.body }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  pages:
+    name: Deploy GitHub Pages
+    runs-on: ubuntu-latest
+    needs: publish
+    if: ${{ secrets.GH_PAGES_PUBLISH == 'true' }}
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download firmware artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Aggregate manifests
+        run: python3 scripts/aggregate_manifests.py dist
+
+      - name: Prepare Pages content
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          CNAME: ${{ secrets.GH_PAGES_CNAME }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p site/releases/"${TAG_NAME}" site/latest
+          cp -a dist/. "site/releases/${TAG_NAME}/"
+          cp -a dist/. site/latest/
+
+          if [ -n "${CNAME:-}" ]; then
+            printf '%s\n' "$CNAME" > site/CNAME
+          fi
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
