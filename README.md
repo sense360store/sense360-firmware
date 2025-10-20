@@ -1,6 +1,6 @@
 # sense360-firmware
 
-[![Release workflow](https://github.com/OWNER/sense360-firmware/actions/workflows/release.yml/badge.svg)](https://github.com/OWNER/sense360-firmware/actions/workflows/release.yml)
+[![Release workflow](https://github.com/sense360store/sense360-firmware/actions/workflows/release.yml/badge.svg)](https://github.com/sense360store/sense360-firmware/actions/workflows/release.yml)
 
 ## Project purpose
 
