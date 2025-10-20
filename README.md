@@ -8,16 +8,16 @@ Sense360 firmware packages the ESPHome configurations that drive the Sense360 fa
 
 ## Repository layout
 
-- `devices/` &mdash; individual ESPHome YAML definitions for supported devices.
+- `firmware/configurations/` &mdash; ESPHome YAML definitions for supported devices.
 - `dist/` &mdash; generated firmware binaries and manifest archives (ignored by Git).
 - `.esphome/` and `.pio/` &mdash; local build and compilation caches created by the ESPHome CLI (ignored by Git).
 - GitHub Actions workflows automate linting, compilation, and release packaging.
 
 ## Adding a new device configuration
 
-1. Create a new YAML file in `devices/` (for example, `devices/<device_name>.yaml`). Use an existing device file as a template when possible.
+1. Create a new YAML file in `firmware/configurations/` (for example, `firmware/configurations/<device_name>.yaml`). Use an existing device file as a template when possible.
 2. Reference common substitutions and secrets through the `!secret` directive to avoid leaking credentials. Add any new required secrets to your local `secrets.yaml` (which stays untracked) and update the "GitHub secrets" section below if a release secret is required.
-3. Run `esphome compile devices/<device_name>.yaml` locally to validate the configuration. This will populate `.esphome/` and `.pio/` caches that are ignored by Git.
+3. Run `esphome compile firmware/configurations/<device_name>.yaml` locally to validate the configuration. This will populate `.esphome/` and `.pio/` caches that are ignored by Git.
 4. Commit the new YAML with a clear summary of the hardware revision and capabilities.
 5. Open a pull request and confirm that the release workflow succeeds so the resulting firmware is available with the next tag.
 
