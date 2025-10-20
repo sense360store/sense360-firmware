@@ -1,0 +1,42 @@
+name: ESPHome Lite CI
+on:
+  push:
+    paths: ["esphome/**"]
+  pull_request:
+    paths: ["esphome/**"]
+  workflow_dispatch:
+
+jobs:
+  build-all:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ESPHome
+        run: pip install --upgrade "esphome>=2024.11.0"
+      - name: Prepare CI secrets placeholder
+        run: |
+          mkdir -p esphome
+          [ -f esphome/secrets.yaml ] || cp esphome/secrets.example.yaml esphome/secrets.yaml
+      - name: Validate & compile all non-factory configs
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          mkdir -p out
+          found=0
+          for cfg in esphome/configs/**/*.yaml; do
+            [[ "$cfg" == *"_factory.yaml" ]] && continue
+            esphome config "$cfg"
+            esphome compile "$cfg"
+            found=1
+          done
+          [ $found -eq 0 ] && echo "No non-factory configs found." && exit 0
+          find . -type f -name "*.bin" -print -exec cp -v {} out/ \;
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-bins
+          path: out
+          if-no-files-found: warn
